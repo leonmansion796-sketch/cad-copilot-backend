@@ -7,12 +7,18 @@ const PORT = process.env.PORT || 3001;
 const MESHY_API_KEY = process.env.MESHY_API_KEY;
 
 // ── Middleware ──
-app.use(cors({
-  origin: "*", // Allow all origins — restrict this to your domain when live
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
-app.use(express.json({ limit: "20mb" })); // Allow large base64 images
+// Very permissive CORS — allows all origins including claude.ai artifacts
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "*");
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+  next();
+});
+
+app.use(express.json({ limit: "25mb" }));
 
 // ── Health check ──
 app.get("/", (req, res) => {
@@ -20,8 +26,6 @@ app.get("/", (req, res) => {
 });
 
 // ── POST /generate-3d ──
-// Accepts: { imageBase64: "...", mediaType: "image/png" }
-// Returns: { taskId: "..." }
 app.post("/generate-3d", async (req, res) => {
   try {
     const { imageBase64, mediaType } = req.body;
@@ -52,6 +56,7 @@ app.post("/generate-3d", async (req, res) => {
     });
 
     const meshyData = await meshyRes.json();
+    console.log("Meshy create response:", JSON.stringify(meshyData));
 
     if (!meshyRes.ok) {
       return res.status(meshyRes.status).json({
@@ -69,7 +74,6 @@ app.post("/generate-3d", async (req, res) => {
 });
 
 // ── GET /task-status/:taskId ──
-// Polls Meshy for task status and returns progress + URLs when done
 app.get("/task-status/:taskId", async (req, res) => {
   try {
     const { taskId } = req.params;
@@ -83,6 +87,7 @@ app.get("/task-status/:taskId", async (req, res) => {
     });
 
     const data = await meshyRes.json();
+    console.log("Meshy poll response:", data.status, data.progress);
 
     if (!meshyRes.ok) {
       return res.status(meshyRes.status).json({
@@ -91,7 +96,7 @@ app.get("/task-status/:taskId", async (req, res) => {
     }
 
     res.json({
-      status: data.status,           // PENDING | IN_PROGRESS | SUCCEEDED | FAILED
+      status: data.status,
       progress: data.progress || 0,
       modelUrls: data.model_urls || null,
       error: data.task_error?.message || null,
