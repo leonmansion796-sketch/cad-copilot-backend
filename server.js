@@ -168,3 +168,25 @@ app.get("/text-task-status/:taskId", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`CAD Copilot Backend v3 running on port ${PORT}`);
 });
+
+// ── GET /proxy-model ── (proxy GLB files to avoid CORS)
+app.get("/proxy-model", async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ error: "url is required" });
+
+    const response = await fetch(url);
+    if (!response.ok) return res.status(response.status).json({ error: "Failed to fetch model" });
+
+    const buffer = await response.buffer();
+    const contentType = response.headers.get("content-type") || "application/octet-stream";
+
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Content-Type", contentType);
+    res.set("Content-Disposition", "inline");
+    res.send(buffer);
+  } catch (err) {
+    console.error("/proxy-model error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
