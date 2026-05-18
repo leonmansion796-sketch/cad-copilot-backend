@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "50mb" }));
 
 app.get("/", (req, res) => {
-  res.json({ status: "CAD Copilot Backend running", version: "8.0.0" });
+  res.json({ status: "CAD Copilot Backend running", version: "9.0.0" });
 });
 
 // ── Meshy endpoints ──
@@ -102,23 +102,23 @@ app.get("/proxy-model", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── STL Parser ──
+// ── STL utilities ──
 function parseBinarySTL(buffer) {
-  const triangles = [];
-  if (buffer.length < 84) return triangles;
+  const tris = [];
+  if (buffer.length < 84) return tris;
   const n = buffer.readUInt32LE(80);
-  let offset = 84;
+  let o = 84;
   for (let i = 0; i < n; i++) {
-    if (offset + 50 > buffer.length) break;
-    triangles.push({
-      normal: [buffer.readFloatLE(offset), buffer.readFloatLE(offset+4), buffer.readFloatLE(offset+8)],
-      v1: [buffer.readFloatLE(offset+12), buffer.readFloatLE(offset+16), buffer.readFloatLE(offset+20)],
-      v2: [buffer.readFloatLE(offset+24), buffer.readFloatLE(offset+28), buffer.readFloatLE(offset+32)],
-      v3: [buffer.readFloatLE(offset+36), buffer.readFloatLE(offset+40), buffer.readFloatLE(offset+44)],
+    if (o + 50 > buffer.length) break;
+    tris.push({
+      normal: [buffer.readFloatLE(o), buffer.readFloatLE(o+4), buffer.readFloatLE(o+8)],
+      v1: [buffer.readFloatLE(o+12), buffer.readFloatLE(o+16), buffer.readFloatLE(o+20)],
+      v2: [buffer.readFloatLE(o+24), buffer.readFloatLE(o+28), buffer.readFloatLE(o+32)],
+      v3: [buffer.readFloatLE(o+36), buffer.readFloatLE(o+40), buffer.readFloatLE(o+44)],
     });
-    offset += 50;
+    o += 50;
   }
-  return triangles;
+  return tris;
 }
 
 function getBBox(tris) {
@@ -131,101 +131,144 @@ function getBBox(tris) {
   return {minX,maxX,minY,maxY,minZ,maxZ};
 }
 
-function lerp(v1,v2,t) {
-  return [v1[0]+(v2[0]-v1[0])*t, v1[1]+(v2[1]-v1[1])*t, v1[2]+(v2[2]-v1[2])*t];
+function lerp(v1, v2, t) {
+  return [
+    v1[0] + (v2[0]-v1[0])*t,
+    v1[1] + (v2[1]-v1[1])*t,
+    v1[2] + (v2[2]-v1[2])*t,
+  ];
 }
 
 function axisIdx(axis) { return axis==='x'?0:axis==='y'?1:2; }
 
-// ── Clip single triangle against one plane ──
-// Returns { below: [triangles], above: [triangles] }
+// ── Snap a vertex to the cut plane to avoid slivers ──
+function snapToPlane(v, axis, cutVal, tolerance=0.001) {
+  const ai = axisIdx(axis);
+  if (Math.abs(v[ai] - cutVal) < tolerance) {
+    const snapped = [...v];
+    snapped[ai] = cutVal;
+    return snapped;
+  }
+  return v;
+}
+
+// ── Compute triangle area ──
+function triArea(v1, v2, v3) {
+  const ax = v2[0]-v1[0], ay = v2[1]-v1[1], az = v2[2]-v1[2];
+  const bx = v3[0]-v1[0], by = v3[1]-v1[1], bz = v3[2]-v1[2];
+  return 0.5 * Math.sqrt(
+    (ay*bz-az*by)**2 + (az*bx-ax*bz)**2 + (ax*by-ay*bx)**2
+  );
+}
+
+// ── Clip single triangle against a plane, with snapping to avoid teeth ──
 function clipTriangle(tri, axis, cutVal) {
   const ai = axisIdx(axis);
   const vs = [tri.v1, tri.v2, tri.v3];
   const cs = vs.map(v => v[ai]);
+  const SNAP = 0.0001;
 
-  const belowMask = cs.map(c => c <= cutVal);
+  // Snap vertices very close to cut plane
+  const snappedVs = vs.map((v, i) => {
+    if (Math.abs(cs[i] - cutVal) < SNAP) {
+      const s = [...v]; s[ai] = cutVal; return s;
+    }
+    return v;
+  });
+  const snappedCs = snappedVs.map(v => v[ai]);
+
+  const belowMask = snappedCs.map(c => c <= cutVal);
   const belowCount = belowMask.filter(Boolean).length;
 
-  if (belowCount === 3) return { below: [tri], above: [] };
-  if (belowCount === 0) return { below: [], above: [tri] };
+  if (belowCount === 3) return { below: [{ ...tri, v1: snappedVs[0], v2: snappedVs[1], v3: snappedVs[2] }], above: [] };
+  if (belowCount === 0) return { below: [], above: [{ ...tri, v1: snappedVs[0], v2: snappedVs[1], v3: snappedVs[2] }] };
 
-  // Find intersection points
+  // Find the two intersection points
+  const pairs = [[0,1],[1,2],[2,0]];
   const intersections = [];
-  for (let i = 0; i < 3; i++) {
-    const j = (i+1)%3;
+  for (const [i,j] of pairs) {
     if (belowMask[i] !== belowMask[j]) {
-      const t = (cutVal - cs[i]) / (cs[j] - cs[i]);
-      intersections.push({ point: lerp(vs[i], vs[j], t), fromIdx: i, toIdx: j });
+      const denom = snappedCs[j] - snappedCs[i];
+      if (Math.abs(denom) < 1e-10) continue;
+      const t = (cutVal - snappedCs[i]) / denom;
+      const pt = lerp(snappedVs[i], snappedVs[j], t);
+      pt[ai] = cutVal; // Force exactly on plane
+      intersections.push({ pt, i, j });
     }
   }
 
   if (intersections.length < 2) {
-    return belowCount > 0 ? { below: [tri], above: [] } : { below: [], above: [tri] };
+    return belowCount > 0
+      ? { below: [tri], above: [] }
+      : { below: [], above: [tri] };
   }
 
-  const p1 = intersections[0].point;
-  const p2 = intersections[1].point;
-  const capNormal = axis==='x'?[1,0,0]:axis==='y'?[0,1,0]:[0,0,1];
+  const p1 = intersections[0].pt;
+  const p2 = intersections[1].pt;
 
-  if (belowCount === 1) {
-    const i0 = belowMask.indexOf(true);
-    return {
-      below: [{ normal: tri.normal, v1: vs[i0], v2: p1, v3: p2 }],
-      above: [
-        { normal: tri.normal, v1: vs[(i0+1)%3], v2: vs[(i0+2)%3], v3: p1 },
-        { normal: tri.normal, v1: vs[(i0+2)%3], v2: p2, v3: p1 },
-        // Cap face for below
-        { normal: capNormal, v1: vs[i0], v2: p2, v3: p1 },
-        // Cap face for above
-        { normal: capNormal.map(n=>-n), v1: p1, v2: p2, v3: vs[(i0+1)%3] },
-      ].filter((_,i)=>i<2),
-    };
-  } else {
-    // belowCount === 2
-    const i0 = belowMask.indexOf(false);
-    const i1 = (i0+1)%3;
-    const i2 = (i0+2)%3;
-    return {
-      below: [
-        { normal: tri.normal, v1: vs[i1], v2: vs[i2], v3: p1 },
-        { normal: tri.normal, v1: vs[i2], v2: p2, v3: p1 },
-      ],
-      above: [{ normal: tri.normal, v1: vs[i0], v2: p2, v3: p1 }],
-    };
-  }
+  // Skip degenerate (zero area) triangles
+  const minArea = 1e-10;
+
+  const makeBelow = () => {
+    if (belowCount === 1) {
+      const i0 = belowMask.indexOf(true);
+      const t = { normal: tri.normal, v1: snappedVs[i0], v2: p1, v3: p2 };
+      return triArea(t.v1, t.v2, t.v3) > minArea ? [t] : [];
+    } else {
+      const i0 = belowMask.indexOf(false);
+      const i1 = (i0+1)%3, i2 = (i0+2)%3;
+      const t1 = { normal: tri.normal, v1: snappedVs[i1], v2: snappedVs[i2], v3: p1 };
+      const t2 = { normal: tri.normal, v1: snappedVs[i2], v2: p2, v3: p1 };
+      return [t1,t2].filter(t => triArea(t.v1,t.v2,t.v3) > minArea);
+    }
+  };
+
+  const makeAbove = () => {
+    if (belowCount === 1) {
+      const i0 = belowMask.indexOf(true);
+      const i1 = (i0+1)%3, i2 = (i0+2)%3;
+      const t1 = { normal: tri.normal, v1: snappedVs[i1], v2: snappedVs[i2], v3: p2 };
+      const t2 = { normal: tri.normal, v1: snappedVs[i1], v2: p2, v3: p1 };
+      return [t1,t2].filter(t => triArea(t.v1,t.v2,t.v3) > minArea);
+    } else {
+      const i0 = belowMask.indexOf(false);
+      const t = { normal: tri.normal, v1: snappedVs[i0], v2: p2, v3: p1 };
+      return triArea(t.v1, t.v2, t.v3) > minArea ? [t] : [];
+    }
+  };
+
+  return { below: makeBelow(), above: makeAbove() };
 }
 
-// ── Apply one plane cut to a set of triangles ──
+// ── Apply one plane cut ──
 function applyPlaneCut(triangles, axis, cutVal) {
-  const below = [];
-  const above = [];
+  const below = [], above = [];
   for (const tri of triangles) {
-    const result = clipTriangle(tri, axis, cutVal);
-    below.push(...result.below);
-    above.push(...result.above);
+    const r = clipTriangle(tri, axis, cutVal);
+    below.push(...r.below);
+    above.push(...r.above);
   }
   return { below, above };
 }
 
-// ── Main slicer: sequential cuts, each on remaining geometry ──
-// Produces clean cuts by properly clipping triangles at boundaries
+// ── Main slicer ──
 function sliceMesh(triangles, cutPlanes, bbox) {
-  // Convert to world coords and group by axis
   const getWorld = (axis, pos) => {
     const mn = axis==='x'?bbox.minX:axis==='y'?bbox.minY:bbox.minZ;
     const mx = axis==='x'?bbox.maxX:axis==='y'?bbox.maxY:bbox.maxZ;
-    return mn + (mx-mn)*pos;
+    return mn + (mx-mn) * Math.max(0.05, Math.min(0.95, pos));
   };
 
-  // Sort cuts: do Y cuts first, then X, then Z for aircraft
+  // Sort: Z first (front/back), then Y (top/bottom), then X (left/right)
+  // This gives cleanest results for aircraft and furniture
+  const axOrder = { z:0, y:1, x:2 };
   const sorted = [...cutPlanes].sort((a,b) => {
-    const axOrder = {y:0, x:1, z:2};
-    if (axOrder[a.axis||'y'] !== axOrder[b.axis||'y']) return axOrder[a.axis||'y'] - axOrder[b.axis||'y'];
+    const ao = axOrder[a.axis||'y'] ?? 1;
+    const bo = axOrder[b.axis||'y'] ?? 1;
+    if (ao !== bo) return ao - bo;
     return (a.position||0.5) - (b.position||0.5);
   });
 
-  // Apply cuts sequentially — each cut splits the REMAINING geometry cleanly
   const parts = [];
   let remaining = [...triangles];
 
@@ -233,26 +276,26 @@ function sliceMesh(triangles, cutPlanes, bbox) {
     const axis = cp.axis || 'y';
     const cutVal = getWorld(axis, cp.position || 0.5);
     const { below, above } = applyPlaneCut(remaining, axis, cutVal);
-    if (below.length > 10) parts.push(below);
+    if (below.length > 5) parts.push(below);
     remaining = above;
   }
 
-  if (remaining.length > 10) parts.push(remaining);
+  if (remaining.length > 5) parts.push(remaining);
   return parts;
 }
 
-function trianglesToBuffer(triangles, name) {
-  const buf = Buffer.alloc(80 + 4 + triangles.length * 50);
+function trianglesToBuffer(tris, name) {
+  const buf = Buffer.alloc(80 + 4 + tris.length * 50);
   buf.write((name||"Part").substring(0,80).padEnd(80,' '), 0, 'ascii');
-  buf.writeUInt32LE(triangles.length, 80);
-  let offset = 84;
-  for (const t of triangles) {
-    buf.writeFloatLE(t.normal[0],offset); buf.writeFloatLE(t.normal[1],offset+4); buf.writeFloatLE(t.normal[2],offset+8);
-    buf.writeFloatLE(t.v1[0],offset+12); buf.writeFloatLE(t.v1[1],offset+16); buf.writeFloatLE(t.v1[2],offset+20);
-    buf.writeFloatLE(t.v2[0],offset+24); buf.writeFloatLE(t.v2[1],offset+28); buf.writeFloatLE(t.v2[2],offset+32);
-    buf.writeFloatLE(t.v3[0],offset+36); buf.writeFloatLE(t.v3[1],offset+40); buf.writeFloatLE(t.v3[2],offset+44);
-    buf.writeUInt16LE(0,offset+48);
-    offset += 50;
+  buf.writeUInt32LE(tris.length, 80);
+  let o = 84;
+  for (const t of tris) {
+    buf.writeFloatLE(t.normal[0],o); buf.writeFloatLE(t.normal[1],o+4); buf.writeFloatLE(t.normal[2],o+8);
+    buf.writeFloatLE(t.v1[0],o+12); buf.writeFloatLE(t.v1[1],o+16); buf.writeFloatLE(t.v1[2],o+20);
+    buf.writeFloatLE(t.v2[0],o+24); buf.writeFloatLE(t.v2[1],o+28); buf.writeFloatLE(t.v2[2],o+32);
+    buf.writeFloatLE(t.v3[0],o+36); buf.writeFloatLE(t.v3[1],o+40); buf.writeFloatLE(t.v3[2],o+44);
+    buf.writeUInt16LE(0,o+48);
+    o += 50;
   }
   return buf;
 }
@@ -264,12 +307,12 @@ app.post("/slice-stl", async (req, res) => {
     if (!stlUrl) return res.status(400).json({ error: "stlUrl is required" });
     if (!cutPlanes || cutPlanes.length === 0) return res.status(400).json({ error: "cutPlanes required" });
 
-    console.log(`Downloading STL... (${cutPlanes.length} cuts)`);
+    console.log(`v9: Downloading STL (${cutPlanes.length} cuts)...`);
     const stlRes = await fetch(stlUrl);
     if (!stlRes.ok) throw new Error(`Failed to download STL: ${stlRes.status}`);
-    const stlBuffer = await stlRes.buffer();
+    const stlBuf = await stlRes.buffer();
 
-    const triangles = parseBinarySTL(stlBuffer);
+    const triangles = parseBinarySTL(stlBuf);
     console.log(`Parsed ${triangles.length} triangles`);
 
     const bbox = getBBox(triangles);
@@ -280,7 +323,7 @@ app.post("/slice-stl", async (req, res) => {
       partName: partNames?.[i] || `Part ${i+1}`,
       triangleCount: tris.length,
       stlBase64: trianglesToBuffer(tris, partNames?.[i] || `Part_${i+1}`).toString('base64'),
-    })).filter(p => p.triangleCount > 10);
+    })).filter(p => p.triangleCount > 5);
 
     res.json({ success: true, parts: results });
   } catch (err) {
@@ -289,4 +332,4 @@ app.post("/slice-stl", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`CAD Copilot Backend v8 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`CAD Copilot Backend v9 running on port ${PORT}`));
