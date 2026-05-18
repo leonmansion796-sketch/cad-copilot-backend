@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "50mb" }));
 
 app.get("/", (req, res) => {
-  res.json({ status: "CAD Copilot Backend running", version: "7.0.0" });
+  res.json({ status: "CAD Copilot Backend running", version: "8.0.0" });
 });
 
 // ── Meshy endpoints ──
@@ -26,25 +26,25 @@ app.post("/generate-3d", async (req, res) => {
     if (!imageBase64) return res.status(400).json({ error: "imageBase64 is required" });
     if (!MESHY_API_KEY) return res.status(500).json({ error: "MESHY_API_KEY not configured" });
     const dataURI = `data:${mediaType || "image/png"};base64,${imageBase64}`;
-    const meshyRes = await fetch("https://api.meshy.ai/openapi/v1/image-to-3d", {
+    const r = await fetch("https://api.meshy.ai/openapi/v1/image-to-3d", {
       method: "POST",
       headers: { "Authorization": `Bearer ${MESHY_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ image_url: dataURI, ai_model: "meshy-6", should_remesh: true, should_texture: true, enable_pbr: true, target_formats: ["glb", "obj", "stl"] }),
     });
-    const data = await meshyRes.json();
-    if (!meshyRes.ok) return res.status(meshyRes.status).json({ error: data?.message || "Meshy error" });
-    res.json({ taskId: data.result });
+    const d = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: d?.message || "Meshy error" });
+    res.json({ taskId: d.result });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get("/task-status/:taskId", async (req, res) => {
   try {
-    const meshyRes = await fetch(`https://api.meshy.ai/openapi/v1/image-to-3d/${req.params.taskId}`, {
+    const r = await fetch(`https://api.meshy.ai/openapi/v1/image-to-3d/${req.params.taskId}`, {
       headers: { "Authorization": `Bearer ${MESHY_API_KEY}` },
     });
-    const data = await meshyRes.json();
-    if (!meshyRes.ok) return res.status(meshyRes.status).json({ error: data?.message });
-    res.json({ status: data.status, progress: data.progress || 0, modelUrls: data.model_urls || null, error: data.task_error?.message || null });
+    const d = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: d?.message });
+    res.json({ status: d.status, progress: d.progress || 0, modelUrls: d.model_urls || null, error: d.task_error?.message || null });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -121,14 +121,124 @@ function parseBinarySTL(buffer) {
   return triangles;
 }
 
-function getBBox(triangles) {
+function getBBox(tris) {
   let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity,minZ=Infinity,maxZ=-Infinity;
-  for (const t of triangles) for (const v of [t.v1,t.v2,t.v3]) {
+  for (const t of tris) for (const v of [t.v1,t.v2,t.v3]) {
     minX=Math.min(minX,v[0]); maxX=Math.max(maxX,v[0]);
     minY=Math.min(minY,v[1]); maxY=Math.max(maxY,v[1]);
     minZ=Math.min(minZ,v[2]); maxZ=Math.max(maxZ,v[2]);
   }
   return {minX,maxX,minY,maxY,minZ,maxZ};
+}
+
+function lerp(v1,v2,t) {
+  return [v1[0]+(v2[0]-v1[0])*t, v1[1]+(v2[1]-v1[1])*t, v1[2]+(v2[2]-v1[2])*t];
+}
+
+function axisIdx(axis) { return axis==='x'?0:axis==='y'?1:2; }
+
+// ── Clip single triangle against one plane ──
+// Returns { below: [triangles], above: [triangles] }
+function clipTriangle(tri, axis, cutVal) {
+  const ai = axisIdx(axis);
+  const vs = [tri.v1, tri.v2, tri.v3];
+  const cs = vs.map(v => v[ai]);
+
+  const belowMask = cs.map(c => c <= cutVal);
+  const belowCount = belowMask.filter(Boolean).length;
+
+  if (belowCount === 3) return { below: [tri], above: [] };
+  if (belowCount === 0) return { below: [], above: [tri] };
+
+  // Find intersection points
+  const intersections = [];
+  for (let i = 0; i < 3; i++) {
+    const j = (i+1)%3;
+    if (belowMask[i] !== belowMask[j]) {
+      const t = (cutVal - cs[i]) / (cs[j] - cs[i]);
+      intersections.push({ point: lerp(vs[i], vs[j], t), fromIdx: i, toIdx: j });
+    }
+  }
+
+  if (intersections.length < 2) {
+    return belowCount > 0 ? { below: [tri], above: [] } : { below: [], above: [tri] };
+  }
+
+  const p1 = intersections[0].point;
+  const p2 = intersections[1].point;
+  const capNormal = axis==='x'?[1,0,0]:axis==='y'?[0,1,0]:[0,0,1];
+
+  if (belowCount === 1) {
+    const i0 = belowMask.indexOf(true);
+    return {
+      below: [{ normal: tri.normal, v1: vs[i0], v2: p1, v3: p2 }],
+      above: [
+        { normal: tri.normal, v1: vs[(i0+1)%3], v2: vs[(i0+2)%3], v3: p1 },
+        { normal: tri.normal, v1: vs[(i0+2)%3], v2: p2, v3: p1 },
+        // Cap face for below
+        { normal: capNormal, v1: vs[i0], v2: p2, v3: p1 },
+        // Cap face for above
+        { normal: capNormal.map(n=>-n), v1: p1, v2: p2, v3: vs[(i0+1)%3] },
+      ].filter((_,i)=>i<2),
+    };
+  } else {
+    // belowCount === 2
+    const i0 = belowMask.indexOf(false);
+    const i1 = (i0+1)%3;
+    const i2 = (i0+2)%3;
+    return {
+      below: [
+        { normal: tri.normal, v1: vs[i1], v2: vs[i2], v3: p1 },
+        { normal: tri.normal, v1: vs[i2], v2: p2, v3: p1 },
+      ],
+      above: [{ normal: tri.normal, v1: vs[i0], v2: p2, v3: p1 }],
+    };
+  }
+}
+
+// ── Apply one plane cut to a set of triangles ──
+function applyPlaneCut(triangles, axis, cutVal) {
+  const below = [];
+  const above = [];
+  for (const tri of triangles) {
+    const result = clipTriangle(tri, axis, cutVal);
+    below.push(...result.below);
+    above.push(...result.above);
+  }
+  return { below, above };
+}
+
+// ── Main slicer: sequential cuts, each on remaining geometry ──
+// Produces clean cuts by properly clipping triangles at boundaries
+function sliceMesh(triangles, cutPlanes, bbox) {
+  // Convert to world coords and group by axis
+  const getWorld = (axis, pos) => {
+    const mn = axis==='x'?bbox.minX:axis==='y'?bbox.minY:bbox.minZ;
+    const mx = axis==='x'?bbox.maxX:axis==='y'?bbox.maxY:bbox.maxZ;
+    return mn + (mx-mn)*pos;
+  };
+
+  // Sort cuts: do Y cuts first, then X, then Z for aircraft
+  const sorted = [...cutPlanes].sort((a,b) => {
+    const axOrder = {y:0, x:1, z:2};
+    if (axOrder[a.axis||'y'] !== axOrder[b.axis||'y']) return axOrder[a.axis||'y'] - axOrder[b.axis||'y'];
+    return (a.position||0.5) - (b.position||0.5);
+  });
+
+  // Apply cuts sequentially — each cut splits the REMAINING geometry cleanly
+  const parts = [];
+  let remaining = [...triangles];
+
+  for (const cp of sorted) {
+    const axis = cp.axis || 'y';
+    const cutVal = getWorld(axis, cp.position || 0.5);
+    const { below, above } = applyPlaneCut(remaining, axis, cutVal);
+    if (below.length > 10) parts.push(below);
+    remaining = above;
+  }
+
+  if (remaining.length > 10) parts.push(remaining);
+  return parts;
 }
 
 function trianglesToBuffer(triangles, name) {
@@ -147,94 +257,6 @@ function trianglesToBuffer(triangles, name) {
   return buf;
 }
 
-// ── Region-based slicer ──
-// Each part is defined by a bounding region — triangle centroids are assigned
-// to exactly ONE part based on which region they fall in. No overlap, no interference.
-function buildRegions(cutPlanes, bbox) {
-  // Convert all cutPlanes to world coordinates and build regions
-  const getWorld = (axis, pos) => {
-    const min = axis==='x'?bbox.minX:axis==='y'?bbox.minY:bbox.minZ;
-    const max = axis==='x'?bbox.maxX:axis==='y'?bbox.maxY:bbox.maxZ;
-    return min + (max-min)*pos;
-  };
-
-  // Build sorted boundaries per axis
-  const axisBounds = { x: [], y: [], z: [] };
-  for (const cp of cutPlanes) {
-    const axis = cp.axis || 'y';
-    axisBounds[axis].push(getWorld(axis, cp.position || 0.5));
-  }
-  // Sort each axis boundaries
-  for (const ax of ['x','y','z']) axisBounds[ax].sort((a,b)=>a-b);
-
-  // Build region grid
-  const xBounds = [-Infinity, ...axisBounds.x, Infinity];
-  const yBounds = [-Infinity, ...axisBounds.y, Infinity];
-  const zBounds = [-Infinity, ...axisBounds.z, Infinity];
-
-  const regions = [];
-  for (let xi=0; xi<xBounds.length-1; xi++) {
-    for (let yi=0; yi<yBounds.length-1; yi++) {
-      for (let zi=0; zi<zBounds.length-1; zi++) {
-        regions.push({
-          xMin: xBounds[xi], xMax: xBounds[xi+1],
-          yMin: yBounds[yi], yMax: yBounds[yi+1],
-          zMin: zBounds[zi], zMax: zBounds[zi+1],
-          triangles: [],
-        });
-      }
-    }
-  }
-
-  return regions;
-}
-
-function getCentroid(tri) {
-  return [
-    (tri.v1[0]+tri.v2[0]+tri.v3[0])/3,
-    (tri.v1[1]+tri.v2[1]+tri.v3[1])/3,
-    (tri.v1[2]+tri.v2[2]+tri.v3[2])/3,
-  ];
-}
-
-function regionBasedSlice(triangles, cutPlanes) {
-  const bbox = getBBox(triangles);
-  const regions = buildRegions(cutPlanes, bbox);
-
-  // Assign each triangle to exactly one region based on centroid
-  for (const tri of triangles) {
-    const [cx, cy, cz] = getCentroid(tri);
-    for (const region of regions) {
-      if (cx >= region.xMin && cx < region.xMax &&
-          cy >= region.yMin && cy < region.yMax &&
-          cz >= region.zMin && cz < region.zMax) {
-        region.triangles.push(tri);
-        break; // Each triangle goes to exactly ONE region
-      }
-    }
-  }
-
-  return regions.filter(r => r.triangles.length > 10);
-}
-
-// ── Match regions to part names ──
-// Regions are ordered spatially — match them to parts by their cut plane positions
-function matchRegionsToParts(regions, cutPlanes, partNames, bbox) {
-  if (regions.length <= partNames.length) {
-    // Simple 1:1 matching
-    return regions.map((r, i) => ({
-      partName: partNames[i] || `Part ${i+1}`,
-      triangles: r.triangles,
-    }));
-  }
-
-  // More regions than parts — merge small adjacent regions
-  return regions.map((r, i) => ({
-    partName: partNames[i] || `Part ${i+1}`,
-    triangles: r.triangles,
-  }));
-}
-
 // ── POST /slice-stl ──
 app.post("/slice-stl", async (req, res) => {
   try {
@@ -242,7 +264,7 @@ app.post("/slice-stl", async (req, res) => {
     if (!stlUrl) return res.status(400).json({ error: "stlUrl is required" });
     if (!cutPlanes || cutPlanes.length === 0) return res.status(400).json({ error: "cutPlanes required" });
 
-    console.log(`Downloading STL... (${cutPlanes.length} cuts, ${partNames?.length} parts)`);
+    console.log(`Downloading STL... (${cutPlanes.length} cuts)`);
     const stlRes = await fetch(stlUrl);
     if (!stlRes.ok) throw new Error(`Failed to download STL: ${stlRes.status}`);
     const stlBuffer = await stlRes.buffer();
@@ -250,17 +272,14 @@ app.post("/slice-stl", async (req, res) => {
     const triangles = parseBinarySTL(stlBuffer);
     console.log(`Parsed ${triangles.length} triangles`);
 
-    // Use region-based slicing — no overlap, no interference
-    const regions = regionBasedSlice(triangles, cutPlanes);
-    console.log(`Created ${regions.length} regions:`, regions.map(r => r.triangles.length));
+    const bbox = getBBox(triangles);
+    const parts = sliceMesh(triangles, cutPlanes, bbox);
+    console.log(`Parts:`, parts.map(p => p.length));
 
-    // Match to part names
-    const parts = matchRegionsToParts(regions, cutPlanes, partNames || [], getBBox(triangles));
-
-    const results = parts.map(p => ({
-      partName: p.partName,
-      triangleCount: p.triangles.length,
-      stlBase64: trianglesToBuffer(p.triangles, p.partName).toString('base64'),
+    const results = parts.map((tris, i) => ({
+      partName: partNames?.[i] || `Part ${i+1}`,
+      triangleCount: tris.length,
+      stlBase64: trianglesToBuffer(tris, partNames?.[i] || `Part_${i+1}`).toString('base64'),
     })).filter(p => p.triangleCount > 10);
 
     res.json({ success: true, parts: results });
@@ -270,4 +289,4 @@ app.post("/slice-stl", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`CAD Copilot Backend v7 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`CAD Copilot Backend v8 running on port ${PORT}`));
