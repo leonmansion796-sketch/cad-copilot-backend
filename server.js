@@ -484,4 +484,60 @@ app.post("/slice-stl", async (req, res) => {
   }
 });
 
+
+// ══════════════════════════════════════════════════════
+// ── History Storage (persistent, per user) ──
+// ══════════════════════════════════════════════════════
+const fs = require('fs');
+const path = require('path');
+const HISTORY_DIR = path.join('/tmp', 'cad-history');
+if (!fs.existsSync(HISTORY_DIR)) fs.mkdirSync(HISTORY_DIR, { recursive: true });
+
+function historyPath(userId, tool) {
+  // Sanitise userId to prevent path traversal
+  const safe = (userId||'anon').replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 64);
+  const safeTool = (tool||'image').replace(/[^a-z]/g, '');
+  return path.join(HISTORY_DIR, `${safe}_${safeTool}.json`);
+}
+
+// GET /history/:tool?userId=xxx
+app.get('/history/:tool', (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const p = historyPath(userId, req.params.tool);
+    if (!fs.existsSync(p)) return res.json({ history: [] });
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    res.json({ history: data });
+  } catch(e) { res.json({ history: [] }); }
+});
+
+// POST /history/:tool  { userId, history: [...] }
+app.post('/history/:tool', (req, res) => {
+  try {
+    const { userId, history } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const p = historyPath(userId, req.params.tool);
+    // Keep last 20 entries, strip huge base64 fields to save space
+    const trimmed = (history || []).slice(0, 20).map(e => ({
+      ...e,
+      // Keep stlBase64 but truncate fullResult to save space  
+      fullResult: e.fullResult ? { ...e.fullResult, openscad: undefined } : undefined,
+    }));
+    fs.writeFileSync(p, JSON.stringify(trimmed));
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /history/:tool  { userId }
+app.delete('/history/:tool', (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const p = historyPath(userId, req.params.tool);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => console.log(`CAD Copilot Backend v10 running on port ${PORT}`));
