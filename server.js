@@ -455,13 +455,19 @@ function trianglesToBuffer(tris, name) {
 // ══════════════════════════════════════════════════════
 app.post("/slice-stl", async (req, res) => {
   try {
-    const { stlUrl, cutPlanes, partNames, targetParts } = req.body;
-    if (!stlUrl) return res.status(400).json({ error: "stlUrl is required" });
+    const { stlUrl, stlBase64, cutPlanes, partNames, targetParts } = req.body;
+    if (!stlUrl && !stlBase64) return res.status(400).json({ error: "stlUrl or stlBase64 is required" });
 
-    console.log(`v10: Downloading STL...`);
-    const stlRes = await fetch(stlUrl);
-    if (!stlRes.ok) throw new Error(`Failed to download STL: ${stlRes.status}`);
-    const stlBuf = await stlRes.buffer();
+    let stlBuf;
+    if (stlBase64) {
+      console.log(`v10: Using base64 STL...`);
+      stlBuf = Buffer.from(stlBase64, 'base64');
+    } else {
+      console.log(`v10: Downloading STL...`);
+      const stlRes = await fetch(stlUrl);
+      if (!stlRes.ok) throw new Error(`Failed to download STL: ${stlRes.status}`);
+      stlBuf = await stlRes.buffer();
+    }
 
     const triangles = parseBinarySTL(stlBuf);
     console.log(`Parsed ${triangles.length} triangles`);
