@@ -452,79 +452,56 @@ function trianglesToBuffer(tris, name) {
 
 
 // ══════════════════════════════════════════════════════
-// ── Hollow STL: offset all triangles inward by wallThickness ──
-// Creates inner shell by inverting normals and scaling toward centroid
+// ── Hollow STL: creates a shell by scaling mesh inward
+// Much more reliable than vertex normal offsetting
 // ══════════════════════════════════════════════════════
-function hollowTriangles(tris, wallThickness) {
+function hollowTriangles(tris, wallThicknessMm) {
   if (!tris || tris.length === 0) return tris;
-  const mm = wallThickness || 2.0;
+  const t = wallThicknessMm || 2.0;
 
-  // Step 1: Compute bounding box centroid
-  let cx=0, cy=0, cz=0;
-  for (const t of tris) {
-    for (const v of [t.v1, t.v2, t.v3]) {
-      cx += v[0]; cy += v[1]; cz += v[2];
+  // Step 1: Find bounding box and centroid
+  let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity,minZ=Infinity,maxZ=-Infinity;
+  for (const tri of tris) {
+    for (const v of [tri.v1, tri.v2, tri.v3]) {
+      if(v[0]<minX)minX=v[0]; if(v[0]>maxX)maxX=v[0];
+      if(v[1]<minY)minY=v[1]; if(v[1]>maxY)maxY=v[1];
+      if(v[2]<minZ)minZ=v[2]; if(v[2]>maxZ)maxZ=v[2];
     }
   }
-  const n = tris.length * 3;
-  cx /= n; cy /= n; cz /= n;
+  const cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2;
+  const sizeX=maxX-minX, sizeY=maxY-minY, sizeZ=maxZ-minZ;
+  const maxSize=Math.max(sizeX,sizeY,sizeZ)||1;
 
-  // Step 2: Compute average edge length for scaling offset
-  let totalEdge = 0, edgeCount = 0;
-  for (const t of tris) {
-    const edges = [
-      Math.hypot(t.v2[0]-t.v1[0], t.v2[1]-t.v1[1], t.v2[2]-t.v1[2]),
-      Math.hypot(t.v3[0]-t.v2[0], t.v3[1]-t.v2[1], t.v3[2]-t.v2[2]),
+  // Step 2: Calculate scale factor for inner shell
+  // We shrink by wallThickness in all directions
+  const scaleX = Math.max(0.01, (sizeX - t*2) / sizeX);
+  const scaleY = Math.max(0.01, (sizeY - t*2) / sizeY);
+  const scaleZ = Math.max(0.01, (sizeZ - t*2) / sizeZ);
+
+  // If wall thickness is too large relative to part, just return filled
+  if (scaleX < 0.1 || scaleY < 0.1 || scaleZ < 0.1) {
+    console.log('Wall thickness too large for this part, returning filled');
+    return tris;
+  }
+
+  // Step 3: Create inner shell — scale vertices toward centroid, flip normals & winding
+  const innerShell = tris.map(tri => {
+    const scaleV = (v) => [
+      cx + (v[0] - cx) * scaleX,
+      cy + (v[1] - cy) * scaleY,
+      cz + (v[2] - cz) * scaleZ,
     ];
-    for (const e of edges) { totalEdge += e; edgeCount++; }
-  }
-  const avgEdge = totalEdge / edgeCount;
+    return {
+      // Flip normal and reverse winding order for inward-facing faces
+      normal: [-tri.normal[0], -tri.normal[1], -tri.normal[2]],
+      v1: scaleV(tri.v3),
+      v2: scaleV(tri.v2),
+      v3: scaleV(tri.v1),
+    };
+  });
 
-  // Step 3: Offset each vertex along its averaged normal direction
-  // Build vertex normal map
-  const vnormals = new Map();
-  const vkey = (v) => `${v[0].toFixed(4)},${v[1].toFixed(4)},${v[2].toFixed(4)}`;
-
-  for (const t of tris) {
-    const n = t.normal;
-    for (const v of [t.v1, t.v2, t.v3]) {
-      const k = vkey(v);
-      if (!vnormals.has(k)) vnormals.set(k, [0,0,0,0]);
-      const acc = vnormals.get(k);
-      acc[0] += n[0]; acc[1] += n[1]; acc[2] += n[2]; acc[3]++;
-    }
-  }
-
-  // Normalize accumulated normals
-  const normalisedNormals = new Map();
-  for (const [k, acc] of vnormals) {
-    const len = Math.hypot(acc[0], acc[1], acc[2]) || 1;
-    normalisedNormals.set(k, [acc[0]/len, acc[1]/len, acc[2]/len]);
-  }
-
-  // Step 4: Offset vertex inward along normal by wallThickness
-  const offsetVertex = (v) => {
-    const k = vkey(v);
-    const vn = normalisedNormals.get(k) || [0,0,0];
-    return [
-      v[0] - vn[0] * mm,
-      v[1] - vn[1] * mm,
-      v[2] - vn[2] * mm,
-    ];
-  };
-
-  // Step 5: Build inner shell (inverted normals)
-  const innerShell = tris.map(t => ({
-    normal: [-t.normal[0], -t.normal[1], -t.normal[2]],
-    v1: offsetVertex(t.v3), // reversed winding for inward face
-    v2: offsetVertex(t.v2),
-    v3: offsetVertex(t.v1),
-  }));
-
-  // Step 6: Combine outer shell + inner shell
-  // Also add cap triangles at boundary to close the shell
-  const combined = [...tris, ...innerShell];
-  return combined;
+  // Step 4: Outer shell + inner shell = hollow part
+  return [...tris, ...innerShell];
 }
 
 // ══════════════════════════════════════════════════════
