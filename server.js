@@ -1,5 +1,7 @@
 const express = require("express");
 const fetch = require("node-fetch");
+const { spawn } = require("child_process");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -452,14 +454,49 @@ function trianglesToBuffer(tris, name) {
 
 
 // ══════════════════════════════════════════════════════
-// ── Hollow STL: creates a shell by scaling mesh inward
-// Much more reliable than vertex normal offsetting
+// ── Hollow via Python trimesh (proper mesh offsetting) ──
 // ══════════════════════════════════════════════════════
+function hollowWithPython(stlBase64, wallMm) {
+  return new Promise((resolve, reject) => {
+    const scriptPath = path.join(__dirname, 'hollow_stl.py');
+    const py = spawn('python3', [scriptPath, String(wallMm)]);
+
+    let stdout = '';
+    let stderr = '';
+
+    py.stdout.on('data', d => stdout += d.toString());
+    py.stderr.on('data', d => stderr += d.toString());
+
+    py.on('close', code => {
+      try {
+        const result = JSON.parse(stdout.trim());
+        if (result.success) {
+          resolve(result.stlBase64);
+        } else {
+          console.error('Python hollow error:', result.error);
+          reject(new Error(result.error || 'Python hollowing failed'));
+        }
+      } catch(e) {
+        console.error('Python stdout:', stdout);
+        console.error('Python stderr:', stderr);
+        reject(new Error('Failed to parse Python output: ' + e.message));
+      }
+    });
+
+    py.on('error', err => {
+      reject(new Error('Failed to spawn Python: ' + err.message));
+    });
+
+    // Send STL base64 to stdin
+    py.stdin.write(stlBase64);
+    py.stdin.end();
+  });
+}
+
+// Simple JS fallback for when Python unavailable
 function hollowTriangles(tris, wallThicknessMm) {
   if (!tris || tris.length === 0) return tris;
   const t = wallThicknessMm || 2.0;
-
-  // Step 1: Find bounding box and centroid
   let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity,minZ=Infinity,maxZ=-Infinity;
   for (const tri of tris) {
     for (const v of [tri.v1, tri.v2, tri.v3]) {
@@ -469,38 +506,17 @@ function hollowTriangles(tris, wallThicknessMm) {
     }
   }
   const cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2;
-  const sizeX=maxX-minX, sizeY=maxY-minY, sizeZ=maxZ-minZ;
-  const maxSize=Math.max(sizeX,sizeY,sizeZ)||1;
-
-  // Step 2: Calculate scale factor for inner shell
-  // We shrink by wallThickness in all directions
-  const scaleX = Math.max(0.01, (sizeX - t*2) / sizeX);
-  const scaleY = Math.max(0.01, (sizeY - t*2) / sizeY);
-  const scaleZ = Math.max(0.01, (sizeZ - t*2) / sizeZ);
-
-  // If wall thickness is too large relative to part, just return filled
-  if (scaleX < 0.1 || scaleY < 0.1 || scaleZ < 0.1) {
-    console.log('Wall thickness too large for this part, returning filled');
-    return tris;
-  }
-
-  // Step 3: Create inner shell — scale vertices toward centroid, flip normals & winding
-  const innerShell = tris.map(tri => {
-    const scaleV = (v) => [
-      cx + (v[0] - cx) * scaleX,
-      cy + (v[1] - cy) * scaleY,
-      cz + (v[2] - cz) * scaleZ,
-    ];
-    return {
-      // Flip normal and reverse winding order for inward-facing faces
-      normal: [-tri.normal[0], -tri.normal[1], -tri.normal[2]],
-      v1: scaleV(tri.v3),
-      v2: scaleV(tri.v2),
-      v3: scaleV(tri.v1),
-    };
-  });
-
-  // Step 4: Outer shell + inner shell = hollow part
+  const sizeX=maxX-minX||1, sizeY=maxY-minY||1, sizeZ=maxZ-minZ||1;
+  const scaleX=Math.max(0.05,(sizeX-t*2)/sizeX);
+  const scaleY=Math.max(0.05,(sizeY-t*2)/sizeY);
+  const scaleZ=Math.max(0.05,(sizeZ-t*2)/sizeZ);
+  if(scaleX<0.1||scaleY<0.1||scaleZ<0.1) return tris;
+  const innerShell=tris.map(tri=>({
+    normal:[-tri.normal[0],-tri.normal[1],-tri.normal[2]],
+    v1:[cx+(tri.v3[0]-cx)*scaleX, cy+(tri.v3[1]-cy)*scaleY, cz+(tri.v3[2]-cz)*scaleZ],
+    v2:[cx+(tri.v2[0]-cx)*scaleX, cy+(tri.v2[1]-cy)*scaleY, cz+(tri.v2[2]-cz)*scaleZ],
+    v3:[cx+(tri.v1[0]-cx)*scaleX, cy+(tri.v1[1]-cy)*scaleY, cz+(tri.v1[2]-cz)*scaleZ],
+  }));
   return [...tris, ...innerShell];
 }
 
@@ -553,17 +569,28 @@ app.post("/slice-stl", async (req, res) => {
 
 
 // ══════════════════════════════════════════════════════
-// ── POST /hollow-stl — apply hollow shell to a base64 STL ──
+// ── POST /hollow-stl — proper hollowing via Python trimesh ──
 // ══════════════════════════════════════════════════════
 app.post("/hollow-stl", async (req, res) => {
   try {
     const { stlBase64, wallThickness } = req.body;
     if (!stlBase64) return res.status(400).json({ error: "stlBase64 required" });
-    const buf = Buffer.from(stlBase64, 'base64');
-    const triangles = parseBinarySTL(buf);
-    const hollowed = hollowTriangles(triangles, wallThickness || 2.0);
-    const result = trianglesToBuffer(hollowed, "Hollow_Part");
-    res.json({ success: true, stlBase64: result.toString('base64'), triangleCount: hollowed.length });
+    const wall = parseFloat(wallThickness) || 2.0;
+
+    try {
+      // Try Python trimesh first (proper hollowing)
+      const hollowedB64 = await hollowWithPython(stlBase64, wall);
+      const buf = Buffer.from(hollowedB64, 'base64');
+      res.json({ success: true, stlBase64: hollowedB64, triangleCount: (buf.length - 84) / 50, method: 'trimesh' });
+    } catch(pyErr) {
+      console.warn('Python hollow failed, using JS fallback:', pyErr.message);
+      // Fallback to JS method
+      const buf = Buffer.from(stlBase64, 'base64');
+      const triangles = parseBinarySTL(buf);
+      const hollowed = hollowTriangles(triangles, wall);
+      const result = trianglesToBuffer(hollowed, "Hollow_Part");
+      res.json({ success: true, stlBase64: result.toString('base64'), triangleCount: hollowed.length, method: 'js-fallback' });
+    }
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
