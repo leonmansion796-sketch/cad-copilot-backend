@@ -600,7 +600,6 @@ app.post("/hollow-stl", async (req, res) => {
 // ── History Storage (persistent, per user) ──
 // ══════════════════════════════════════════════════════
 const fs = require('fs');
-const path = require('path');
 const HISTORY_DIR = path.join('/tmp', 'cad-history');
 if (!fs.existsSync(HISTORY_DIR)) fs.mkdirSync(HISTORY_DIR, { recursive: true });
 
