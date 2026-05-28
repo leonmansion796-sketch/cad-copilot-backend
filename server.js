@@ -450,12 +450,89 @@ function trianglesToBuffer(tris, name) {
   return buf;
 }
 
+
+// ══════════════════════════════════════════════════════
+// ── Hollow STL: offset all triangles inward by wallThickness ──
+// Creates inner shell by inverting normals and scaling toward centroid
+// ══════════════════════════════════════════════════════
+function hollowTriangles(tris, wallThickness) {
+  if (!tris || tris.length === 0) return tris;
+  const mm = wallThickness || 2.0;
+
+  // Step 1: Compute bounding box centroid
+  let cx=0, cy=0, cz=0;
+  for (const t of tris) {
+    for (const v of [t.v1, t.v2, t.v3]) {
+      cx += v[0]; cy += v[1]; cz += v[2];
+    }
+  }
+  const n = tris.length * 3;
+  cx /= n; cy /= n; cz /= n;
+
+  // Step 2: Compute average edge length for scaling offset
+  let totalEdge = 0, edgeCount = 0;
+  for (const t of tris) {
+    const edges = [
+      Math.hypot(t.v2[0]-t.v1[0], t.v2[1]-t.v1[1], t.v2[2]-t.v1[2]),
+      Math.hypot(t.v3[0]-t.v2[0], t.v3[1]-t.v2[1], t.v3[2]-t.v2[2]),
+    ];
+    for (const e of edges) { totalEdge += e; edgeCount++; }
+  }
+  const avgEdge = totalEdge / edgeCount;
+
+  // Step 3: Offset each vertex along its averaged normal direction
+  // Build vertex normal map
+  const vnormals = new Map();
+  const vkey = (v) => `${v[0].toFixed(4)},${v[1].toFixed(4)},${v[2].toFixed(4)}`;
+
+  for (const t of tris) {
+    const n = t.normal;
+    for (const v of [t.v1, t.v2, t.v3]) {
+      const k = vkey(v);
+      if (!vnormals.has(k)) vnormals.set(k, [0,0,0,0]);
+      const acc = vnormals.get(k);
+      acc[0] += n[0]; acc[1] += n[1]; acc[2] += n[2]; acc[3]++;
+    }
+  }
+
+  // Normalize accumulated normals
+  const normalisedNormals = new Map();
+  for (const [k, acc] of vnormals) {
+    const len = Math.hypot(acc[0], acc[1], acc[2]) || 1;
+    normalisedNormals.set(k, [acc[0]/len, acc[1]/len, acc[2]/len]);
+  }
+
+  // Step 4: Offset vertex inward along normal by wallThickness
+  const offsetVertex = (v) => {
+    const k = vkey(v);
+    const vn = normalisedNormals.get(k) || [0,0,0];
+    return [
+      v[0] - vn[0] * mm,
+      v[1] - vn[1] * mm,
+      v[2] - vn[2] * mm,
+    ];
+  };
+
+  // Step 5: Build inner shell (inverted normals)
+  const innerShell = tris.map(t => ({
+    normal: [-t.normal[0], -t.normal[1], -t.normal[2]],
+    v1: offsetVertex(t.v3), // reversed winding for inward face
+    v2: offsetVertex(t.v2),
+    v3: offsetVertex(t.v1),
+  }));
+
+  // Step 6: Combine outer shell + inner shell
+  // Also add cap triangles at boundary to close the shell
+  const combined = [...tris, ...innerShell];
+  return combined;
+}
+
 // ══════════════════════════════════════════════════════
 // ── POST /slice-stl ──
 // ══════════════════════════════════════════════════════
 app.post("/slice-stl", async (req, res) => {
   try {
-    const { stlUrl, stlBase64, cutPlanes, partNames, targetParts } = req.body;
+    const { stlUrl, stlBase64, cutPlanes, partNames, targetParts, hollow, wallThickness } = req.body;
     if (!stlUrl && !stlBase64) return res.status(400).json({ error: "stlUrl or stlBase64 is required" });
 
     let stlBuf;
@@ -477,11 +554,17 @@ app.post("/slice-stl", async (req, res) => {
     const parts = smartSlice(triangles, numParts, cutPlanes?.length > 0 ? cutPlanes : null);
     console.log(`Parts created:`, parts.map(p => p.length));
 
-    const results = parts.map((tris, i) => ({
-      partName: partNames?.[i] || `Part ${i+1}`,
-      triangleCount: tris.length,
-      stlBase64: trianglesToBuffer(tris, partNames?.[i] || `Part_${i+1}`).toString('base64'),
-    })).filter(p => p.triangleCount > 5);
+    const results = parts.map((tris, i) => {
+      // Apply hollow/fill setting per part
+      const finalTris = hollow ? hollowTriangles(tris, wallThickness || 2.0) : tris;
+      return {
+        partName: partNames?.[i] || `Part ${i+1}`,
+        triangleCount: finalTris.length,
+        stlBase64: trianglesToBuffer(finalTris, partNames?.[i] || `Part_${i+1}`).toString('base64'),
+        hollow: !!hollow,
+        wallThickness: hollow ? (wallThickness || 2.0) : null,
+      };
+    }).filter(p => p.triangleCount > 5);
 
     res.json({ success: true, parts: results, method: cutPlanes?.length > 0 ? "manual" : "auto-detect" });
   } catch (err) {
@@ -490,6 +573,24 @@ app.post("/slice-stl", async (req, res) => {
   }
 });
 
+
+
+// ══════════════════════════════════════════════════════
+// ── POST /hollow-stl — apply hollow shell to a base64 STL ──
+// ══════════════════════════════════════════════════════
+app.post("/hollow-stl", async (req, res) => {
+  try {
+    const { stlBase64, wallThickness } = req.body;
+    if (!stlBase64) return res.status(400).json({ error: "stlBase64 required" });
+    const buf = Buffer.from(stlBase64, 'base64');
+    const triangles = parseBinarySTL(buf);
+    const hollowed = hollowTriangles(triangles, wallThickness || 2.0);
+    const result = trianglesToBuffer(hollowed, "Hollow_Part");
+    res.json({ success: true, stlBase64: result.toString('base64'), triangleCount: hollowed.length });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ══════════════════════════════════════════════════════
 // ── History Storage (persistent, per user) ──
