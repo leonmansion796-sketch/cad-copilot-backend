@@ -596,6 +596,274 @@ app.post("/hollow-stl", async (req, res) => {
   }
 });
 
+
+// ══════════════════════════════════════════════════════
+// ── Joint Generation ──
+// Detects shared boundary between parts and adds pin/socket geometry
+// ══════════════════════════════════════════════════════
+
+function generateCylinderTriangles(cx, cy, cz, radius, height, axis, segments=16) {
+  // Generate triangles for a cylinder along given axis
+  const tris = [];
+  const axisVec = axis === 'x' ? [1,0,0] : axis === 'y' ? [0,1,0] : [0,0,1];
+  const uVec = axis === 'x' ? [0,1,0] : axis === 'y' ? [1,0,0] : [1,0,0];
+  const vVec = axis === 'x' ? [0,0,1] : axis === 'y' ? [0,0,1] : [0,1,0];
+
+  const getPoint = (theta, h) => [
+    cx + uVec[0]*Math.cos(theta)*radius + vVec[0]*Math.sin(theta)*radius + axisVec[0]*h,
+    cy + uVec[1]*Math.cos(theta)*radius + vVec[1]*Math.sin(theta)*radius + axisVec[1]*h,
+    cz + uVec[2]*Math.cos(theta)*radius + vVec[2]*Math.sin(theta)*radius + axisVec[2]*h,
+  ];
+
+  for (let i = 0; i < segments; i++) {
+    const t1 = (i / segments) * Math.PI * 2;
+    const t2 = ((i + 1) / segments) * Math.PI * 2;
+    const p1b = getPoint(t1, 0), p2b = getPoint(t2, 0);
+    const p1t = getPoint(t1, height), p2t = getPoint(t2, height);
+    const center_b = [cx, cy, cz];
+    const center_t = [cx + axisVec[0]*height, cy + axisVec[1]*height, cz + axisVec[2]*height];
+
+    // Side face (2 triangles)
+    const sn = [
+      (uVec[0]*Math.cos(t1) + vVec[0]*Math.sin(t1)),
+      (uVec[1]*Math.cos(t1) + vVec[1]*Math.sin(t1)),
+      (uVec[2]*Math.cos(t1) + vVec[2]*Math.sin(t1)),
+    ];
+    tris.push({normal:sn, v1:p1b, v2:p2b, v3:p2t});
+    tris.push({normal:sn, v1:p1b, v2:p2t, v3:p1t});
+
+    // Bottom cap
+    tris.push({normal:[-axisVec[0],-axisVec[1],-axisVec[2]], v1:center_b, v2:p2b, v3:p1b});
+    // Top cap
+    tris.push({normal:axisVec, v1:center_t, v2:p1t, v3:p2t});
+  }
+  return tris;
+}
+
+function findSharedBoundary(trisA, trisB, tolerance=0.5) {
+  // Find centroid of triangles near the boundary between two parts
+  const PREC = 100;
+  const vkey = (v) => `${Math.round(v[0]*PREC)},${Math.round(v[1]*PREC)},${Math.round(v[2]*PREC)}`;
+
+  // Build vertex sets for each part
+  const vertsA = new Set();
+  for (const t of trisA) {
+    vertsA.add(vkey(t.v1)); vertsA.add(vkey(t.v2)); vertsA.add(vkey(t.v3));
+  }
+
+  // Find triangles in B that share vertices with A (boundary triangles)
+  const boundaryTrisB = trisB.filter(t =>
+    vertsA.has(vkey(t.v1)) || vertsA.has(vkey(t.v2)) || vertsA.has(vkey(t.v3))
+  );
+
+  if (boundaryTrisB.length === 0) {
+    // Fall back: find closest triangles by centroid distance
+    const centA = trisA.reduce((acc,t)=>({
+      x:acc.x+(t.v1[0]+t.v2[0]+t.v3[0])/3,
+      y:acc.y+(t.v1[1]+t.v2[1]+t.v3[1])/3,
+      z:acc.z+(t.v1[2]+t.v2[2]+t.v3[2])/3,
+    }),{x:0,y:0,z:0});
+    centA.x/=trisA.length; centA.y/=trisA.length; centA.z/=trisA.length;
+    return {x:centA.x, y:centA.y, z:centA.z, confidence:'low'};
+  }
+
+  // Average centroid of boundary triangles
+  let bx=0,by=0,bz=0;
+  for (const t of boundaryTrisB) {
+    bx+=(t.v1[0]+t.v2[0]+t.v3[0])/3;
+    by+=(t.v1[1]+t.v2[1]+t.v3[1])/3;
+    bz+=(t.v1[2]+t.v2[2]+t.v3[2])/3;
+  }
+  return {
+    x:bx/boundaryTrisB.length,
+    y:by/boundaryTrisB.length,
+    z:bz/boundaryTrisB.length,
+    confidence:'high',
+    boundaryCount:boundaryTrisB.length
+  };
+}
+
+function getBoundingBox(tris) {
+  let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9,minZ=1e9,maxZ=-1e9;
+  for (const t of tris) {
+    for (const v of [t.v1,t.v2,t.v3]) {
+      if(v[0]<minX)minX=v[0]; if(v[0]>maxX)maxX=v[0];
+      if(v[1]<minY)minY=v[1]; if(v[1]>maxY)maxY=v[1];
+      if(v[2]<minZ)minZ=v[2]; if(v[2]>maxZ)maxZ=v[2];
+    }
+  }
+  return {minX,maxX,minY,maxY,minZ,maxZ,
+    cx:(minX+maxX)/2, cy:(minY+maxY)/2, cz:(minZ+maxZ)/2,
+    sx:maxX-minX, sy:maxY-minY, sz:maxZ-minZ};
+}
+
+function addPinToTriangles(tris, pinCx, pinCy, pinCz, radius, height, axis) {
+  // Add pin geometry extruding outward from the part surface
+  const pinTris = generateCylinderTriangles(pinCx, pinCy, pinCz, radius, height, axis);
+  return [...tris, ...pinTris];
+}
+
+function addSocketToTriangles(tris, sockCx, sockCy, sockCz, radius, depth, axis) {
+  // Approximate socket by adding a cylinder with inverted normals (subtraction hint)
+  // True boolean subtraction needs CSG - here we mark it and export OpenSCAD for accuracy
+  const socketTris = generateCylinderTriangles(sockCx, sockCy, sockCz, radius, depth, axis)
+    .map(t => ({
+      normal: [-t.normal[0], -t.normal[1], -t.normal[2]],
+      v1: t.v3, v2: t.v2, v3: t.v1  // flip winding = inward faces
+    }));
+  return [...tris, ...socketTris];
+}
+
+function generateJointOpenSCAD(parts, joints) {
+  const lines = [
+    `// CAD Copilot — Auto-generated joint geometry`,
+    `// Generated: ${new Date().toISOString()}`,
+    `// Import each part STL and add joints as shown below`,
+    ``,
+    `// Joint parameters (adjust to suit your printer tolerances)`,
+    `PIN_RADIUS = 3;      // mm — pin radius`,
+    `PIN_HEIGHT = 8;      // mm — pin length`,
+    `SOCKET_RADIUS = 3.2; // mm — socket radius (slightly larger for fit)`,
+    `SOCKET_DEPTH = 8.5;  // mm — socket depth`,
+    `TOLERANCE = 0.2;     // mm — clearance gap`,
+    ``,
+  ];
+
+  parts.forEach((part, i) => {
+    const joint = joints[i];
+    if (!joint) return;
+    lines.push(`// ── Part ${i+1}: ${part.partName} ──`);
+    lines.push(`module part_${i+1}_with_joint() {`);
+    lines.push(`  union() {`);
+    lines.push(`    import("${part.partName.replace(/\s+/g,'_')}.stl");`);
+    if (joint.role === 'pin') {
+      lines.push(`    // Pin joint at boundary`);
+      lines.push(`    translate([${joint.x.toFixed(2)}, ${joint.y.toFixed(2)}, ${joint.z.toFixed(2)}])`);
+      lines.push(`      ${joint.axis === 'x' ? 'rotate([0,90,0])' : joint.axis === 'y' ? '' : 'rotate([90,0,0])'}`);
+      lines.push(`        cylinder(h=PIN_HEIGHT, r=PIN_RADIUS, $fn=32);`);
+    } else {
+      lines.push(`    // Socket joint at boundary (difference removes material)`);
+      lines.push(`    difference() {`);
+      lines.push(`      children();`);
+      lines.push(`      translate([${joint.x.toFixed(2)}, ${joint.y.toFixed(2)}, ${joint.z.toFixed(2)}])`);
+      lines.push(`        ${joint.axis === 'x' ? 'rotate([0,90,0])' : joint.axis === 'y' ? '' : 'rotate([90,0,0])'}`);
+      lines.push(`          cylinder(h=SOCKET_DEPTH, r=SOCKET_RADIUS, $fn=32);`);
+      lines.push(`    }`);
+    }
+    lines.push(`  }`);
+    lines.push(`}`);
+    lines.push(`part_${i+1}_with_joint();`);
+    lines.push(``);
+  });
+
+  lines.push(`// Assembly preview — uncomment to see all parts together:`);
+  parts.forEach((part, i) => {
+    lines.push(`// part_${i+1}_with_joint();`);
+  });
+
+  return lines.join('\n');
+}
+
+// ── POST /generate-joints ──
+app.post('/generate-joints', async (req, res) => {
+  try {
+    const { parts } = req.body;
+    if (!parts || parts.length < 2) {
+      return res.status(400).json({ error: 'Need at least 2 parts' });
+    }
+
+    console.log(`Generating joints for ${parts.length} parts...`);
+
+    // Parse STL triangles for each part
+    const partTris = parts.map(p => {
+      const buf = Buffer.from(p.stlBase64, 'base64');
+      return parseBinarySTL(buf);
+    });
+
+    // Get bounding boxes
+    const boxes = partTris.map(getBoundingBox);
+
+    // Find boundaries between adjacent parts and determine joint positions/axes
+    const joints = [];
+    for (let i = 0; i < parts.length; i++) {
+      const boundary = findSharedBoundary(partTris[i], partTris[(i+1) % parts.length]);
+      const boxA = boxes[i], boxB = boxes[(i+1) % parts.length];
+
+      // Determine best axis based on which dimension has least overlap
+      const overlapX = Math.min(boxA.maxX,boxB.maxX) - Math.max(boxA.minX,boxB.minX);
+      const overlapY = Math.min(boxA.maxY,boxB.maxY) - Math.max(boxA.minY,boxB.minY);
+      const overlapZ = Math.min(boxA.maxZ,boxB.maxZ) - Math.max(boxA.minZ,boxB.minZ);
+      const minOverlap = Math.min(Math.abs(overlapX), Math.abs(overlapY), Math.abs(overlapZ));
+      const axis = Math.abs(overlapX) === minOverlap ? 'x' : Math.abs(overlapY) === minOverlap ? 'y' : 'z';
+
+      // Pin radius = 8% of smallest part dimension, capped at 5mm
+      const minDim = Math.min(boxA.sx, boxA.sy, boxA.sz, boxB.sx, boxB.sy, boxB.sz);
+      const pinRadius = Math.min(5, Math.max(1.5, minDim * 0.08));
+      const pinHeight = pinRadius * 2.5;
+
+      joints.push({
+        x: boundary.x, y: boundary.y, z: boundary.z,
+        axis, pinRadius, pinHeight,
+        role: i % 2 === 0 ? 'pin' : 'socket',
+        confidence: boundary.confidence,
+      });
+    }
+
+    // Generate modified STL parts with pin geometry added
+    const resultParts = await Promise.all(parts.map(async (part, i) => {
+      try {
+        const joint = joints[i];
+        if (!joint) return { ...part, jointAdded: false };
+
+        let modifiedTris = parseBinarySTL(Buffer.from(part.stlBase64, 'base64'));
+
+        if (joint.role === 'pin') {
+          modifiedTris = addPinToTriangles(
+            modifiedTris, joint.x, joint.y, joint.z,
+            joint.pinRadius, joint.pinHeight, joint.axis
+          );
+        }
+        // Socket is better done via OpenSCAD — flag it
+        const buf = trianglesToBuffer(modifiedTris, part.partName);
+        return {
+          ...part,
+          stlBase64: buf.toString('base64'),
+          triangleCount: modifiedTris.length,
+          jointAdded: true,
+          jointRole: joint.role,
+          jointAxis: joint.axis,
+          jointPosition: { x: joint.x, y: joint.y, z: joint.z },
+          pinRadius: joint.pinRadius,
+          pinHeight: joint.pinHeight,
+          confidence: joint.confidence,
+        };
+      } catch(e) {
+        console.warn(`Joint failed for part ${i}:`, e.message);
+        return { ...part, jointAdded: false };
+      }
+    }));
+
+    // Generate OpenSCAD file covering all joints
+    const openscad = generateJointOpenSCAD(resultParts, joints);
+
+    res.json({
+      success: true,
+      parts: resultParts,
+      openscad,
+      joints: joints.map((j,i) => ({
+        betweenParts: `${parts[i]?.partName} ↔ ${parts[(i+1)%parts.length]?.partName}`,
+        axis: j.axis,
+        pinRadius: j.pinRadius.toFixed(1),
+        pinHeight: j.pinHeight.toFixed(1),
+        confidence: j.confidence,
+      })),
+    });
+  } catch(err) {
+    console.error('/generate-joints error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════
 // ── History Storage (persistent, per user) ──
 // ══════════════════════════════════════════════════════
